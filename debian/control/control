@@ -1,0 +1,9 @@
+Package: [[name]]
+Version: [[version]]
+Section: misc
+Priority: optional
+Architecture: all
+Depends:
+Recommends: oracle-java-8
+Description: Disthene cleaner
+Maintainer: Andrei Ivanov

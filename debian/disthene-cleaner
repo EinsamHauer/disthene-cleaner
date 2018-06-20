@@ -1,0 +1,9 @@
+#!/bin/bash
+
+if [ -f /etc/default/disthene-cleaner ]; then
+    . /etc/default/disthene-cleaner
+fi
+
+JAR="/usr/lib/disthene-cleaner/disthene-cleaner.jar"
+
+java $JAVA_OPTS -jar $JAR "$@"
