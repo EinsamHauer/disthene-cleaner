@@ -16,6 +16,7 @@ public class DistheneCleanerParameters {
 //    private List<Rollup> rollups = new ArrayList<>();
     private long threshold;
     private List<String> exclusions = new ArrayList<>();
+    private boolean noop = false;
 
     public String getTenant() {
         return tenant;
@@ -75,6 +76,18 @@ public class DistheneCleanerParameters {
         return exclusions;
     }
 
+    public void setExclusions(List<String> exclusions) {
+        this.exclusions = exclusions;
+    }
+
+    public boolean isNoop() {
+        return noop;
+    }
+
+    public void setNoop(boolean noop) {
+        this.noop = noop;
+    }
+
     @Override
     public String toString() {
         return "DistheneCleanerParameters{" +
@@ -84,6 +97,7 @@ public class DistheneCleanerParameters {
                 ", elasticSearchContactPoint='" + elasticSearchContactPoint + '\'' +
                 ", threshold=" + threshold +
                 ", exclusions=" + exclusions +
+                ", noop=" + noop +
                 '}';
     }
 }

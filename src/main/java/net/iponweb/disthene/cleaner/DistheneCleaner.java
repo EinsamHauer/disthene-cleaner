@@ -26,6 +26,7 @@ public class DistheneCleaner {
         options.addOption("th", "threshold", true, "Threshold");
         options.addOption("ex", "exclude", true, "Exclude paths, comma separated list of wildcards");
         options.addOption("tn", "tenant", true, "Tenant");
+        options.addOption("n", "noop", false, "Noop mode");
 
         CommandLineParser parser = new GnuParser();
 
@@ -87,6 +88,10 @@ public class DistheneCleaner {
                 for (String exclusion : split) {
                     parameters.addExclusion(exclusion);
                 }
+            }
+
+            if (commandLine.hasOption("n")) {
+                parameters.setNoop(true);
             }
 
             logger.info("Running with the following parameters: " + parameters);

@@ -77,7 +77,9 @@ class Cleaner {
 
         logger.info("Getting paths");
         final List<String> paths = getTenantPaths(parameters.getTenant());
+        logger.info("Got " + paths.size() + " paths");
         paths.removeIf(path -> excludePattern.matcher(path).matches());
+        logger.info("Left " + paths.size() + " paths after excluding");
 
         ListeningExecutorService executor = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(parameters.getThreads()));
 
@@ -94,7 +96,8 @@ class Cleaner {
                             tenantStatement,
                             commonDeleteStatement,
                             tenantDeleteStatement,
-                            path
+                            path,
+                            parameters.isNoop()
                     )
             );
             Futures.addCallback(future, new FutureCallback<Void>() {
@@ -229,8 +232,12 @@ class Cleaner {
         List<String> pathsToDelete = getEmptyPaths(tree);
 
         for(String path : pathsToDelete) {
-            client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
-            logger.info("Deleted path: " + path);
+            if (!parameters.isNoop()) {
+                client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
+                logger.info("Deleted path: " + path);
+            } else {
+                logger.info("Deleted path: " + path + " (noop)");
+            }
         }
     }
 
@@ -261,7 +268,6 @@ class Cleaner {
     private static class PathTree {
         private List<PathNode> roots = new ArrayList<>();
         private Map<String, PathNode> map = new HashMap<>();
-        private int size;
 
         void addNode(PathNode node) {
             String parent = node.getParent();
@@ -271,7 +277,6 @@ class Cleaner {
                 roots.add(node);
             }
             map.put(node.path, node);
-            size++;
         }
     }
 
@@ -325,6 +330,8 @@ class Cleaner {
         private PreparedStatement commonDeleteStatement;
         private PreparedStatement tenantDeleteStatement;
         private String path;
+        private boolean noop;
+
 
         SinglePathCallable(
                 TransportClient client,
@@ -334,7 +341,9 @@ class Cleaner {
                 PreparedStatement tenantStatement,
                 PreparedStatement commonDeleteStatement,
                 PreparedStatement tenantDeleteStatement,
-                String path) {
+                String path,
+                boolean noop
+        ) {
             this.client = client;
             this.session = session;
             this.tenant = tenant;
@@ -343,6 +352,7 @@ class Cleaner {
             this.commonDeleteStatement = commonDeleteStatement;
             this.tenantDeleteStatement = tenantDeleteStatement;
             this.path = path;
+            this.noop = noop;
         }
 
         @Override
@@ -352,11 +362,15 @@ class Cleaner {
             futures.add(session.executeAsync(tenantStatement.bind(path)));
 
             if (Futures.allAsList(futures).get().stream().mapToInt(rs -> rs.all().size()).sum() <= 0) {
-                session.execute(commonDeleteStatement.bind(path));
-                session.execute(tenantDeleteStatement.bind(path));
+                if (!noop) {
+                    session.execute(commonDeleteStatement.bind(path));
+                    session.execute(tenantDeleteStatement.bind(path));
 
-                client.prepareDelete("cyanite_paths", "path", tenant + "_" + path).execute().get();
-                logger.info("Deleted path data: " + path);
+                    client.prepareDelete("cyanite_paths", "path", tenant + "_" + path).execute().get();
+                    logger.info("Deleted path data: " + path);
+                } else {
+                    logger.info("Deleted path data: " + path + " (noop)");
+                }
             }
 
             return null;
