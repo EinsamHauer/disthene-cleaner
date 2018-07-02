@@ -11,10 +11,12 @@ import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.index.query.FilterBuilders;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.SearchHit;
 
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -44,7 +46,7 @@ class Cleaner {
         excludePattern = Pattern.compile(parameters.getExclusions().stream().map(WildcardUtil::getPathsRegExFromWildcard).collect(Collectors.joining("|")));
     }
 
-    void clean() throws ExecutionException, InterruptedException {
+    void clean() throws ExecutionException, InterruptedException, IOException {
 
         Long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
 
@@ -57,6 +59,12 @@ class Cleaner {
 
         connectToES();
         connectToCassandra();
+
+        logger.info("Repairing paths");
+        restoreBrokenPaths();
+        logger.info("Repaired paths");
+        logger.info("Waiting a couple of minutes to allow reindexing");
+        Thread.sleep(120000);
 
         final PreparedStatement commonStatement = session.prepare(
                 "select path from metric.metric where tenant = '" + parameters.getTenant() +
@@ -201,37 +209,12 @@ class Cleaner {
     }
 
     private void deleteEmptyPaths() throws ExecutionException, InterruptedException {
-        PathTree tree = new PathTree();
-        List<Path> paths = new ArrayList<>();
-
-        SearchResponse response = client.prepareSearch("cyanite_paths")
-                .setScroll(new TimeValue(120000))
-                .setSize(100000)
-                .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
-                .addFields("path", "leaf")
-                .execute().actionGet();
-
-        while (response.getHits().getHits().length > 0) {
-            for (SearchHit hit : response.getHits()) {
-                paths.add(new Path(hit.field("path").getValue(), hit.field("leaf").getValue()));
-            }
-
-            response = client.prepareSearchScroll(response.getScrollId())
-                    .setScroll(new TimeValue(120000))
-                    .execute().actionGet();
-        }
-
-        logger.info("Number of paths: " + paths.size());
-
-        Collections.sort(paths);
-        for(Path path : paths) {
-            tree.addNode(new PathNode(path.path, path.leaf));
-        }
+        PathTree tree = getPathsTree();
 
         // traverse tree
         List<String> pathsToDelete = getEmptyPaths(tree);
 
-        for(String path : pathsToDelete) {
+        for (String path : pathsToDelete) {
             if (!parameters.isNoop()) {
                 client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
                 logger.info("Deleted path: " + path);
@@ -244,7 +227,7 @@ class Cleaner {
     private List<String> getEmptyPaths(PathTree tree) {
         List<String> result = new ArrayList<>();
 
-        for(PathNode node : tree.roots) {
+        for (PathNode node : tree.roots) {
             hasToBeDeleted(node, result);
         }
 
@@ -262,6 +245,83 @@ class Cleaner {
         if (toBeDeleted) emptyPaths.add(node.path);
 
         return toBeDeleted;
+    }
+
+    private void restoreBrokenPaths() throws ExecutionException, InterruptedException, IOException {
+        PathTree tree = getPathsTree();
+        Set<String> repairedPaths = new HashSet<>();
+
+        // restore all paths with depth > 1 and no parent
+        for (PathNode node : tree.roots) {
+            if (node.depth > 1) {
+
+                String[] parts = node.path.split("\\.");
+
+                final StringBuilder sb = new StringBuilder();
+
+                for (int i = 0; i < parts.length; i++) {
+                    if (sb.toString().length() > 0) {
+                        sb.append(".");
+                    }
+                    sb.append(parts[i]);
+
+                    String pathToIndex = sb.toString();
+
+                    if (!tree.map.containsKey(pathToIndex) && !repairedPaths.contains(pathToIndex)) {
+
+                        if (!parameters.isNoop()) {
+                            client.prepareIndex("cyanite_paths", "path", parameters.getTenant() + "_" + pathToIndex)
+                                    .setSource(
+                                            XContentFactory.jsonBuilder().startObject()
+                                                    .field("tenant", parameters.getTenant())
+                                                    .field("path", pathToIndex)
+                                                    .field("depth", (i + 1))
+                                                    .field("leaf", (i == parts.length - 1 && node.children.size() <= 0))
+                                                    .endObject()
+                                    )
+                                    .execute()
+                                    .get();
+                            logger.info("Will reindex path " + pathToIndex + " with depth " + (i + 1) + " as " + ((i == parts.length - 1 && node.children.size() <= 0) ? "leaf" : "non-leaf"));
+                        } else {
+                            logger.info("Will reindex path " + pathToIndex + " with depth " + (i + 1) + " as " + ((i == parts.length - 1 && node.children.size() <= 0) ? "leaf" : "non-leaf") + " (noop)");
+                        }
+
+                        repairedPaths.add(pathToIndex);
+                    }
+                }
+            }
+        }
+    }
+
+    private PathTree getPathsTree() {
+        PathTree tree = new PathTree();
+        List<Path> paths = new ArrayList<>();
+
+        SearchResponse response = client.prepareSearch("cyanite_paths")
+                .setScroll(new TimeValue(120000))
+                .setSize(100000)
+                .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                .addFields("path", "leaf", "depth")
+                .execute().actionGet();
+
+        while (response.getHits().getHits().length > 0) {
+            for (SearchHit hit : response.getHits()) {
+                paths.add(new Path(hit.field("path").getValue(), hit.field("leaf").getValue(), hit.field("depth").getValue()));
+            }
+
+            response = client.prepareSearchScroll(response.getScrollId())
+                    .setScroll(new TimeValue(120000))
+                    .execute().actionGet();
+        }
+
+        logger.info("Number of paths: " + paths.size());
+
+        Collections.sort(paths);
+        for (Path path : paths) {
+            tree.addNode(new PathNode(path.path, path.leaf, path.depth));
+        }
+
+        return tree;
     }
 
 
@@ -284,10 +344,12 @@ class Cleaner {
         private String path;
         private List<PathNode> children = new ArrayList<>();
         private boolean leaf;
+        private int depth;
 
-        PathNode(String path, boolean leaf) {
+        PathNode(String path, boolean leaf, int depth) {
             this.path = path;
             this.leaf = leaf;
+            this.depth = depth;
         }
 
         String getParent() {
@@ -309,10 +371,12 @@ class Cleaner {
     private static class Path implements Comparable<Path> {
         private String path;
         private boolean leaf;
+        private int depth;
 
-        Path(String path, boolean leaf) {
+        Path(String path, boolean leaf, int depth) {
             this.path = path;
             this.leaf = leaf;
+            this.depth = depth;
         }
 
         @Override
