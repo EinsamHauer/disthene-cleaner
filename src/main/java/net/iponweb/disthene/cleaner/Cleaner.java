@@ -5,6 +5,7 @@ import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
 import com.datastax.driver.core.policies.TokenAwarePolicy;
 import com.google.common.util.concurrent.*;
 import org.apache.log4j.Logger;
+import org.elasticsearch.action.count.CountResponse;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.transport.TransportClient;
 import org.elasticsearch.common.settings.ImmutableSettings;
@@ -297,6 +298,15 @@ class Cleaner {
         PathTree tree = new PathTree();
         List<Path> paths = new ArrayList<>();
 
+        CountResponse countResponse = client.prepareCount("cyanite_paths")
+                .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                .execute()
+                .actionGet();
+
+        long count = countResponse.getCount();
+
+        logger.info("A priori number of paths: " + count);
+
         SearchResponse response = client.prepareSearch("cyanite_paths")
                 .setScroll(new TimeValue(120000))
                 .setSize(100000)
@@ -315,6 +325,13 @@ class Cleaner {
         }
 
         logger.info("Number of paths: " + paths.size());
+
+        if (paths.size() < count) {
+            logger.error("Number of paths received is less than a priori count. " + paths.size() + " VS " + count);
+            throw new RuntimeException("Number of paths received is less than a priori count. " + paths.size() + " VS " + count);
+        } else {
+            logger.info("Counting check passed: " + paths.size() + " VS " + count);
+        }
 
         Collections.sort(paths);
         for (Path path : paths) {
