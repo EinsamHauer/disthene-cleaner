@@ -65,6 +65,7 @@ class Cleaner {
         if (resultSet.one().getLong(0) <= 0) {
             // skip
             logger.info("Tenant table doesn't exist. Skipping");
+            return;
         }
 
         logger.info("Repairing paths");
