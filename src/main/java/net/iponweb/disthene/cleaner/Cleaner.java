@@ -31,10 +31,12 @@ import java.util.stream.Collectors;
  * Author: Andrei Ivanov
  * Date: 6/19/18
  */
+@SuppressWarnings("UnstableApiUsage")
 class Cleaner {
     private static Logger logger = Logger.getLogger(Cleaner.class);
 
     private static Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
+    private static final String TABLE_QUERY = "SELECT COUNT(1) FROM SYSTEM.SCHEMA_COLUMNFAMILIES WHERE KEYSPACE_NAME=? AND COLUMNFAMILY_NAME=?";
 
     private DistheneCleanerParameters parameters;
 
@@ -48,18 +50,22 @@ class Cleaner {
     }
 
     void clean() throws ExecutionException, InterruptedException, IOException {
-
-        Long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
+        long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
 
         String tenantTable = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
-//        String tenantTable = String.format("metric_new.%s_60_metric", getNormalizedTenant(parameters.getTenant()));
         String tenantTable900 = String.format("metric.metric_%s_900", getNormalizedTenant(parameters.getTenant()));
-//        String tenantTable900 = String.format("metric_new.%s_900_metric", getNormalizedTenant(parameters.getTenant()));
 
         logger.info("Tenant tables: " + tenantTable + ", " + tenantTable900);
 
         connectToES();
         connectToCassandra();
+
+        // check if tenant table exists. If not, just return
+        ResultSet resultSet = session.execute(TABLE_QUERY, "metric", String.format("metric_%s_60", getNormalizedTenant(parameters.getTenant())));
+        if (resultSet.one().getLong(0) <= 0) {
+            // skip
+            logger.info("Tenant table doesn't exist. Skipping");
+        }
 
         logger.info("Repairing paths");
         restoreBrokenPaths();

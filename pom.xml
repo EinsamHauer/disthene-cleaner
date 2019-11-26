@@ -4,7 +4,7 @@
   <groupId>net.iponweb.disthene.cleaner</groupId>
   <artifactId>disthene-cleaner</artifactId>
   <packaging>jar</packaging>
-  <version>1.0.3</version>
+  <version>1.0.4</version>
   <name>disthene-cleaner</name>
   <url>http://maven.apache.org</url>
   <dependencies>
