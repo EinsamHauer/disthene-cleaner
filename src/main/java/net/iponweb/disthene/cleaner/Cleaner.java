@@ -33,16 +33,16 @@ import java.util.stream.Collectors;
  */
 @SuppressWarnings("UnstableApiUsage")
 class Cleaner {
-    private static Logger logger = Logger.getLogger(Cleaner.class);
+    private static final Logger logger = Logger.getLogger(Cleaner.class);
 
-    private static Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
+    private static final Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
     private static final String TABLE_QUERY = "SELECT COUNT(1) FROM SYSTEM.SCHEMA_COLUMNFAMILIES WHERE KEYSPACE_NAME=? AND COLUMNFAMILY_NAME=?";
 
-    private DistheneCleanerParameters parameters;
+    private final DistheneCleanerParameters parameters;
 
     private TransportClient client;
     private Session session;
-    private Pattern excludePattern;
+    private final Pattern excludePattern;
 
     Cleaner(DistheneCleanerParameters parameters) {
         this.parameters = parameters;
@@ -135,6 +135,7 @@ class Cleaner {
         executor.shutdown();
 
         try {
+            //noinspection ResultOfMethodCallIgnored
             executor.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             logger.error("Failed: ", e);
@@ -350,8 +351,8 @@ class Cleaner {
 
 
     private static class PathTree {
-        private List<PathNode> roots = new ArrayList<>();
-        private Map<String, PathNode> map = new HashMap<>();
+        private final List<PathNode> roots = new ArrayList<>();
+        private final Map<String, PathNode> map = new HashMap<>();
 
         void addNode(PathNode node) {
             String parent = node.getParent();
@@ -365,10 +366,10 @@ class Cleaner {
     }
 
     private static class PathNode {
-        private String path;
-        private List<PathNode> children = new ArrayList<>();
-        private boolean leaf;
-        private int depth;
+        private final String path;
+        private final List<PathNode> children = new ArrayList<>();
+        private final boolean leaf;
+        private final int depth;
 
         PathNode(String path, boolean leaf, int depth) {
             this.path = path;
@@ -393,9 +394,9 @@ class Cleaner {
     }
 
     private static class Path implements Comparable<Path> {
-        private String path;
-        private boolean leaf;
-        private int depth;
+        private final String path;
+        private final boolean leaf;
+        private final int depth;
 
         Path(String path, boolean leaf, int depth) {
             this.path = path;
@@ -410,15 +411,15 @@ class Cleaner {
     }
 
     private static class SinglePathCallable implements Callable<Void> {
-        private TransportClient client;
-        private Session session;
-        private String tenant;
-        private PreparedStatement commonStatement;
-        private PreparedStatement tenantStatement;
-        private PreparedStatement commonDeleteStatement;
-        private PreparedStatement tenantDeleteStatement;
-        private String path;
-        private boolean noop;
+        private final TransportClient client;
+        private final Session session;
+        private final String tenant;
+        private final PreparedStatement commonStatement;
+        private final PreparedStatement tenantStatement;
+        private final PreparedStatement commonDeleteStatement;
+        private final PreparedStatement tenantDeleteStatement;
+        private final String path;
+        private final boolean noop;
 
 
         SinglePathCallable(

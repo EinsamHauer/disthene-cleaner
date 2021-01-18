@@ -67,14 +67,6 @@ public class DistheneCleaner {
             parameters.setCassandraContactPoint(commandLine.getOptionValue("c"));
             parameters.setElasticSearchContactPoint(commandLine.getOptionValue("e"));
 
-/*
-            String rollupsString = commandLine.hasOption("r") ? commandLine.getOptionValue("r") : DEFAULT_ROLLUP_STRING;
-            String[] split = rollupsString.split(",");
-            for (String rollupString : split) {
-                parameters.addRollup(rollupString);
-            }
-
-*/
             parameters.setThreshold(DEFAULT_THRESHOLD);
             if (commandLine.hasOption("th")) {
                 try {

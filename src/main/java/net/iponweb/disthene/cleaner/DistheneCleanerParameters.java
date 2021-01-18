@@ -13,9 +13,8 @@ public class DistheneCleanerParameters {
     private int threads = 1;
     private String cassandraContactPoint;
     private String elasticSearchContactPoint;
-//    private List<Rollup> rollups = new ArrayList<>();
     private long threshold;
-    private List<String> exclusions = new ArrayList<>();
+    private final List<String> exclusions = new ArrayList<>();
     private boolean noop = false;
 
     public String getTenant() {
@@ -50,16 +49,6 @@ public class DistheneCleanerParameters {
         this.elasticSearchContactPoint = elasticSearchContactPoint;
     }
 
-/*
-    public void addRollup(String rollupString) {
-        rollups.add(new Rollup(rollupString));
-    }
-
-    public List<Rollup> getRollups() {
-        return rollups;
-    }
-
-*/
     public long getThreshold() {
         return threshold;
     }
@@ -74,10 +63,6 @@ public class DistheneCleanerParameters {
 
     public List<String> getExclusions() {
         return exclusions;
-    }
-
-    public void setExclusions(List<String> exclusions) {
-        this.exclusions = exclusions;
     }
 
     public boolean isNoop() {
