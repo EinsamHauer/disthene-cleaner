@@ -114,6 +114,8 @@ public class DistheneCleaner {
         if (location != null) {
             try {
                 RollingFileAppender fileAppender = new RollingFileAppender(layout, location);
+                fileAppender.setMaxBackupIndex(100);
+                fileAppender.setMaximumFileSize(100*1024*1024);
                 rootLogger.addAppender(fileAppender);
             } catch (IOException e) {
                 logger.error("Failed to add file appender: ", e);

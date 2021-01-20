@@ -7,13 +7,13 @@ import com.google.common.util.concurrent.*;
 import org.apache.log4j.Logger;
 import org.elasticsearch.action.count.CountResponse;
 import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.client.transport.TransportClient;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.index.query.FilterBuilders;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.SearchHit;
 
@@ -27,12 +27,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-/**
- * Author: Andrei Ivanov
- * Date: 6/19/18
- */
 @SuppressWarnings("UnstableApiUsage")
-class Cleaner {
+public class Cleaner {
+
     private static final Logger logger = Logger.getLogger(Cleaner.class);
 
     private static final Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
@@ -50,13 +47,6 @@ class Cleaner {
     }
 
     void clean() throws ExecutionException, InterruptedException, IOException {
-        long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
-
-        String tenantTable = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
-        String tenantTable900 = String.format("metric.metric_%s_900", getNormalizedTenant(parameters.getTenant()));
-
-        logger.info("Tenant tables: " + tenantTable + ", " + tenantTable900);
-
         connectToES();
         connectToCassandra();
 
@@ -73,6 +63,74 @@ class Cleaner {
         logger.info("Repaired paths");
         logger.info("Waiting a couple of minutes to allow reindexing");
         Thread.sleep(120000);
+
+        logger.info("Cleaning up obsolete metrics");
+        cleanup();
+        logger.info("Cleaned up obsolete metrics");
+        logger.info("Waiting a couple of minutes to allow reindexing");
+        Thread.sleep(120000);
+
+        logger.info("Deleting empty paths");
+        deleteEmptyPaths();
+        logger.info("Deleted empty paths");
+    }
+
+    private void deleteEmptyPaths() throws ExecutionException, InterruptedException {
+        PathTree tree = getPathsTree();
+
+        List<String> pathsToDelete = getEmptyPaths(tree);
+
+        for (String path : pathsToDelete) {
+            if (!parameters.isNoop()) {
+                client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
+                logger.info("Deleted path: " + path);
+            } else {
+                logger.info("Deleted path: " + path + " (noop)");
+            }
+        }
+    }
+
+    private List<String> getEmptyPaths(PathTree tree) {
+        List<String> result = new ArrayList<>();
+
+        for (Map.Entry<String, PathData> entry : tree.roots.entrySet()) {
+            hasToBeDeleted(entry.getKey(), entry.getValue(), result);
+        }
+
+        return result;
+    }
+
+    private void hasToBeDeleted(String path, PathData node, List<String> emptyPaths) {
+        boolean toBeDeleted = !node.leaf;
+
+        for (Map.Entry<String, PathData> entry : node.children.entrySet()) {
+            boolean childHasToBeDeleted = hasToBeDeleted(path + ".", entry.getKey(), entry.getValue(), emptyPaths);
+            toBeDeleted = toBeDeleted && childHasToBeDeleted;
+        }
+
+        if (toBeDeleted) emptyPaths.add(path);
+    }
+
+    private boolean hasToBeDeleted(String prefix, String path, PathData node, List<String> emptyPaths) {
+        boolean toBeDeleted = !node.leaf;
+
+        for (Map.Entry<String, PathData> entry : node.children.entrySet()) {
+            boolean childHasToBeDeleted = hasToBeDeleted(prefix + path + ".", entry.getKey(), entry.getValue(), emptyPaths);
+            toBeDeleted = toBeDeleted && childHasToBeDeleted;
+        }
+
+        if (toBeDeleted) emptyPaths.add(prefix + path);
+
+        return toBeDeleted;
+    }
+
+    private void cleanup() {
+        long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
+
+        String tenantTable = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
+        String tenantTable900 = String.format("metric.metric_%s_900", getNormalizedTenant(parameters.getTenant()));
+
+        logger.info("Tenant tables: " + tenantTable + ", " + tenantTable900);
 
         final PreparedStatement commonStatement = session.prepare(
                 "select path from metric.metric where tenant = '" + parameters.getTenant() +
@@ -91,45 +149,79 @@ class Cleaner {
                 "delete from " + tenantTable900 + " where path = ?"
         );
 
-        logger.info("Getting paths");
-        final List<String> paths = getTenantPaths(parameters.getTenant());
-        logger.info("Got " + paths.size() + " paths");
-        paths.removeIf(path -> excludePattern.matcher(path).matches());
-        logger.info("Left " + paths.size() + " paths after excluding");
+        CountResponse countResponse = client.prepareCount("cyanite_paths")
+                .setQuery(
+                        QueryBuilders.boolQuery()
+                                .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                                .must(QueryBuilders.termQuery("leaf", true))
+                )
+                .execute()
+                .actionGet();
 
+        long total = countResponse.getCount();
+        logger.info("Got " + total + " paths");
+
+        final AtomicInteger counter = new AtomicInteger(0);
         ListeningExecutorService executor = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(parameters.getThreads()));
 
-        int total = paths.size();
-        final AtomicInteger counter = new AtomicInteger(0);
+        SearchResponse response = client.prepareSearch("cyanite_paths")
+                .setSearchType(SearchType.SCAN)
+                .setScroll(new TimeValue(4, TimeUnit.HOURS))
+                .setSize(10_000)
+                .setQuery(
+                        QueryBuilders.boolQuery()
+                                .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                                .must(QueryBuilders.termQuery("leaf", true))
+                )
+                .setSearchType(SearchType.SCAN)
+                .addField("path")
+                .execute().actionGet();
 
-        for (String path : paths) {
-            ListenableFuture<Void> future = executor.submit(
-                    new SinglePathCallable(
-                            client,
-                            session,
-                            parameters.getTenant(),
-                            commonStatement,
-                            tenantStatement,
-                            commonDeleteStatement,
-                            tenantDeleteStatement,
-                            path,
-                            parameters.isNoop()
-                    )
-            );
-            Futures.addCallback(future, new FutureCallback<Void>() {
-                @Override
-                public void onSuccess(Void aVoid) {
-                    int cc = counter.addAndGet(1);
-                    if (cc % 100000 == 0) {
-                        logger.info("Processed: " + cc * 100 / total + "%");
-                    }
+        response = client.prepareSearchScroll(response.getScrollId())
+                .setScroll(new TimeValue(4, TimeUnit.HOURS))
+                .execute().actionGet();
+
+        while (response.getHits().getHits().length > 0) {
+            for (SearchHit hit : response.getHits()) {
+                String path = hit.field("path").getValue();
+
+                if (!excludePattern.matcher(path).matches()) {
+                    ListenableFuture<Void> future = executor.submit(
+                            new SinglePathCallable(
+                                    client,
+                                    session,
+                                    parameters.getTenant(),
+                                    commonStatement,
+                                    tenantStatement,
+                                    commonDeleteStatement,
+                                    tenantDeleteStatement,
+                                    path,
+                                    parameters.isNoop()
+                            )
+                    );
+                    Futures.addCallback(future, new FutureCallback<Void>() {
+                        @Override
+                        public void onSuccess(Void aVoid) {
+                            int cc = counter.addAndGet(1);
+                            if (cc % 100000 == 0) {
+                                logger.info("Processed: " + (int)(((double) cc / total) * 100) + "%");
+                            }
+                        }
+
+                        @Override
+                        public void onFailure(Throwable throwable) {
+                            logger.error("Unexpected error:", throwable);
+                        }
+                    });
+                } else {
+                    counter.addAndGet(1);
                 }
 
-                @Override
-                public void onFailure(Throwable throwable) {
-                    logger.error("Unexpected error:", throwable);
-                }
-            });
+            }
+
+            response = client.prepareSearchScroll(response.getScrollId())
+                    .setScroll(new TimeValue(4, TimeUnit.HOURS))
+                    .execute().actionGet();
         }
 
         executor.shutdown();
@@ -141,15 +233,18 @@ class Cleaner {
             logger.error("Failed: ", e);
         }
 
-        logger.info("Waiting a couple of minutes to allow reindexing");
-        Thread.sleep(120000);
+        logger.info("Processed " + counter.get() + " paths");
+    }
 
-        logger.info("Deleting empty paths");
-        deleteEmptyPaths();
+    private static String getNormalizedTenant(String tenant) {
+        return NORMALIZATION_PATTERN.matcher(tenant).replaceAll("_");
     }
 
     private void connectToES() {
-        Settings settings = ImmutableSettings.settingsBuilder().put("cluster.name", "cyanite").build();
+        Settings settings = ImmutableSettings.settingsBuilder()
+                .put("cluster.name", "cyanite")
+                .put("client.transport.ping_timeout", "120s")
+                .build();
         client = new TransportClient(settings);
         client.addTransportAddress(new InetSocketTransportAddress(parameters.getElasticSearchContactPoint(), 9300));
     }
@@ -159,8 +254,8 @@ class Cleaner {
         socketOptions.setReceiveBufferSize(8388608);
         socketOptions.setSendBufferSize(1048576);
         socketOptions.setTcpNoDelay(false);
-        socketOptions.setReadTimeoutMillis(1000000);
-        socketOptions.setReadTimeoutMillis(1000000);
+        socketOptions.setReadTimeoutMillis(1_000_000);
+        socketOptions.setReadTimeoutMillis(1_000_000);
 
         PoolingOptions poolingOptions = new PoolingOptions();
         poolingOptions.setMaxConnectionsPerHost(HostDistance.LOCAL, 32);
@@ -188,123 +283,52 @@ class Cleaner {
         session = cluster.connect();
     }
 
-    private List<String> getTenantPaths(String tenant) {
-        final List<String> paths = new ArrayList<>();
-
-        SearchResponse response = client.prepareSearch("cyanite_paths")
-                .setScroll(new TimeValue(120000))
-                .setSize(100000)
-                .setQuery(QueryBuilders.filteredQuery(QueryBuilders.filteredQuery(
-                        QueryBuilders.regexpQuery("path", ".*"),
-                        FilterBuilders.termFilter("tenant", tenant)), FilterBuilders.termFilter("leaf", true)))
-                .addField("path")
-                .execute().actionGet();
-
-        while (response.getHits().getHits().length > 0) {
-            for (SearchHit hit : response.getHits()) {
-                paths.add(hit.field("path").getValue());
-            }
-
-            response = client.prepareSearchScroll(response.getScrollId())
-                    .setScroll(new TimeValue(120000))
-                    .execute().actionGet();
-        }
-
-        return paths;
-    }
-
-    private static String getNormalizedTenant(String tenant) {
-        return NORMALIZATION_PATTERN.matcher(tenant).replaceAll("_");
-    }
-
-    private void deleteEmptyPaths() throws ExecutionException, InterruptedException {
+    private void restoreBrokenPaths() throws IOException, ExecutionException, InterruptedException {
         PathTree tree = getPathsTree();
 
-        // traverse tree
-        List<String> pathsToDelete = getEmptyPaths(tree);
+        int depth = 1;
 
-        for (String path : pathsToDelete) {
-            if (!parameters.isNoop()) {
-                client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
-                logger.info("Deleted path: " + path);
-            } else {
-                logger.info("Deleted path: " + path + " (noop)");
+        for (Map.Entry<String, PathData> entry : tree.roots.entrySet()) {
+            if (!entry.getValue().real) {
+                restoreSinglePath(entry.getKey(), entry.getValue().leaf && entry.getValue().children.size() == 0, depth);
             }
+
+            restoreBrokenPaths(entry.getValue(), entry.getKey(), depth + 1);
         }
     }
 
-    private List<String> getEmptyPaths(PathTree tree) {
-        List<String> result = new ArrayList<>();
-
-        for (PathNode node : tree.roots) {
-            hasToBeDeleted(node, result);
-        }
-
-        return result;
-    }
-
-    private boolean hasToBeDeleted(PathNode node, List<String> emptyPaths) {
-        boolean toBeDeleted = !node.leaf;
-
-        for (PathNode child : node.children) {
-            boolean childHasToBeDeleted = hasToBeDeleted(child, emptyPaths);
-            toBeDeleted = toBeDeleted && childHasToBeDeleted;
-        }
-
-        if (toBeDeleted) emptyPaths.add(node.path);
-
-        return toBeDeleted;
-    }
-
-    private void restoreBrokenPaths() throws ExecutionException, InterruptedException, IOException {
-        PathTree tree = getPathsTree();
-        Set<String> repairedPaths = new HashSet<>();
-
-        // restore all paths with depth > 1 and no parent
-        for (PathNode node : tree.roots) {
-            if (node.depth > 1) {
-
-                String[] parts = node.path.split("\\.");
-
-                final StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < parts.length; i++) {
-                    if (sb.toString().length() > 0) {
-                        sb.append(".");
-                    }
-                    sb.append(parts[i]);
-
-                    String pathToIndex = sb.toString();
-
-                    if (!tree.map.containsKey(pathToIndex) && !repairedPaths.contains(pathToIndex)) {
-
-                        if (!parameters.isNoop()) {
-                            client.prepareIndex("cyanite_paths", "path", parameters.getTenant() + "_" + pathToIndex)
-                                    .setSource(
-                                            XContentFactory.jsonBuilder().startObject()
-                                                    .field("tenant", parameters.getTenant())
-                                                    .field("path", pathToIndex)
-                                                    .field("depth", (i + 1))
-                                                    .field("leaf", (i == parts.length - 1 && node.children.size() <= 0))
-                                                    .endObject()
-                                    )
-                                    .execute()
-                                    .get();
-                            logger.info("Will reindex path " + pathToIndex + " with depth " + (i + 1) + " as " + ((i == parts.length - 1 && node.children.size() <= 0) ? "leaf" : "non-leaf"));
-                        } else {
-                            logger.info("Will reindex path " + pathToIndex + " with depth " + (i + 1) + " as " + ((i == parts.length - 1 && node.children.size() <= 0) ? "leaf" : "non-leaf") + " (noop)");
-                        }
-
-                        repairedPaths.add(pathToIndex);
-                    }
-                }
+    private void restoreBrokenPaths(PathData node, String prefix, int depth) throws IOException, ExecutionException, InterruptedException {
+        for (Map.Entry<String, PathData> entry : node.children.entrySet()) {
+            if (!entry.getValue().real) {
+                restoreSinglePath(prefix + "." + entry.getKey(), entry.getValue().leaf && entry.getValue().children.size() == 0, depth);
             }
+
+            restoreBrokenPaths(entry.getValue(), prefix + "." + entry.getKey(), depth + 1);
+        }
+
+    }
+
+    private void restoreSinglePath(String path, boolean leaf, int depth) throws IOException, ExecutionException, InterruptedException {
+        if (!parameters.isNoop()) {
+            client.prepareIndex("cyanite_paths", "path", parameters.getTenant() + "_" + path)
+                    .setSource(
+                            XContentFactory.jsonBuilder().startObject()
+                                    .field("tenant", parameters.getTenant())
+                                    .field("path", path)
+                                    .field("depth", depth)
+                                    .field("leaf", leaf)
+                                    .endObject()
+                    )
+                    .execute()
+                    .get();
+            logger.info("Will reindex path " + path + " with depth " + depth + " as " + (leaf ? "leaf" : "non-leaf"));
+        } else {
+            logger.info("Will reindex path " + path + " with depth " + depth + " as " + (leaf ? "leaf" : "non-leaf") + " (noop)");
         }
     }
 
     private PathTree getPathsTree() {
         PathTree tree = new PathTree();
-        List<Path> paths = new ArrayList<>();
 
         CountResponse countResponse = client.prepareCount("cyanite_paths")
                 .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
@@ -312,101 +336,74 @@ class Cleaner {
                 .actionGet();
 
         long count = countResponse.getCount();
-
         logger.info("A priori number of paths: " + count);
+        logger.info("Retrieving paths");
 
         SearchResponse response = client.prepareSearch("cyanite_paths")
-                .setScroll(new TimeValue(120000))
-                .setSize(100000)
+                .setSearchType(SearchType.SCAN)
+                .setScroll(new TimeValue(4, TimeUnit.HOURS))
+                .setSize(10_000)
                 .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
-                .addFields("path", "leaf", "depth")
+                .addFields("path", "leaf")
                 .execute().actionGet();
+
+        response = client.prepareSearchScroll(response.getScrollId())
+                .setScroll(new TimeValue(4, TimeUnit.HOURS))
+                .execute().actionGet();
+
+        long counter = 0;
 
         while (response.getHits().getHits().length > 0) {
             for (SearchHit hit : response.getHits()) {
-                paths.add(new Path(hit.field("path").getValue(), hit.field("leaf").getValue(), hit.field("depth").getValue()));
+                tree.addPath(hit.field("path").getValue(), hit.field("leaf").getValue());
+                counter++;
             }
+            logger.info("Retrieved: " + (int)(((double) counter / count) * 100) + "%");
 
             response = client.prepareSearchScroll(response.getScrollId())
-                    .setScroll(new TimeValue(120000))
+                    .setScroll(new TimeValue(4, TimeUnit.HOURS))
                     .execute().actionGet();
         }
 
-        logger.info("Number of paths: " + paths.size());
+        logger.info("Number of paths: " + counter);
 
-        if (paths.size() < count) {
-            logger.error("Number of paths received is less than a priori count. " + paths.size() + " VS " + count);
-            throw new RuntimeException("Number of paths received is less than a priori count. " + paths.size() + " VS " + count);
+        if (counter < count) {
+            logger.error("Number of paths received is less than a priori count. " + counter + " VS " + count);
+            throw new RuntimeException("Number of paths received is less than a priori count. " + counter + " VS " + count);
         } else {
-            logger.info("Counting check passed: " + paths.size() + " VS " + count);
-        }
-
-        Collections.sort(paths);
-        for (Path path : paths) {
-            tree.addNode(new PathNode(path.path, path.leaf, path.depth));
+            logger.info("Counting check passed: " + counter + " VS " + count);
         }
 
         return tree;
     }
 
-
     private static class PathTree {
-        private final List<PathNode> roots = new ArrayList<>();
-        private final Map<String, PathNode> map = new HashMap<>();
+        private final Map<String, PathData> roots = new HashMap<>();
 
-        void addNode(PathNode node) {
-            String parent = node.getParent();
-            if (parent != null && map.containsKey(parent)) {
-                map.get(parent).addChild(node);
-            } else {
-                roots.add(node);
+        void addPath(String path, boolean leaf) {
+            String[] parts = path.split("\\.");
+
+            PathData node = roots.computeIfAbsent(parts[0], p -> new PathData(parts.length == 1, leaf && parts.length == 1));
+
+            if (parts.length == 1) node.real = true;
+
+            for (int i = 1; i < parts.length; i++) {
+                boolean real = parts.length == i + 1;
+                node = node.children.computeIfAbsent(parts[i], p -> new PathData(real, leaf && real));
+                if (real) node.real = true;
             }
-            map.put(node.path, node);
         }
+
     }
 
-    private static class PathNode {
-        private final String path;
-        private final List<PathNode> children = new ArrayList<>();
+    private static class PathData {
+        private boolean real;
         private final boolean leaf;
-        private final int depth;
+        private final Map<String, PathData> children = new HashMap<>();
 
-        PathNode(String path, boolean leaf, int depth) {
-            this.path = path;
+        public PathData(boolean real, boolean leaf) {
+            this.real = real;
             this.leaf = leaf;
-            this.depth = depth;
-        }
-
-        String getParent() {
-            if (path != null) {
-                int lastDot = path.lastIndexOf(".");
-                if (lastDot != -1) {
-                    return path.substring(0, lastDot);
-                }
-            }
-
-            return null;
-        }
-
-        void addChild(PathNode node) {
-            this.children.add(node);
-        }
-    }
-
-    private static class Path implements Comparable<Path> {
-        private final String path;
-        private final boolean leaf;
-        private final int depth;
-
-        Path(String path, boolean leaf, int depth) {
-            this.path = path;
-            this.leaf = leaf;
-            this.depth = depth;
-        }
-
-        @Override
-        public int compareTo(Path o) {
-            return this.path.compareTo(o.path);
         }
     }
 
