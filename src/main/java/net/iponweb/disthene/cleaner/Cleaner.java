@@ -5,13 +5,19 @@ import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
 import com.datastax.driver.core.policies.TokenAwarePolicy;
 import com.google.common.util.concurrent.*;
 import org.apache.log4j.Logger;
+import org.elasticsearch.action.bulk.BulkProcessor;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.count.CountResponse;
+import org.elasticsearch.action.delete.DeleteRequest;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.client.transport.TransportClient;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.index.query.QueryBuilders;
@@ -75,19 +81,49 @@ public class Cleaner {
         logger.info("Deleted empty paths");
     }
 
-    private void deleteEmptyPaths() throws ExecutionException, InterruptedException {
+    private void deleteEmptyPaths() throws InterruptedException {
         PathTree tree = getPathsTree();
 
         List<String> pathsToDelete = getEmptyPaths(tree);
 
+        BulkProcessor bulkProcessor = BulkProcessor.builder(
+                client,
+                new BulkProcessor.Listener() {
+                    @Override
+                    public void beforeBulk(long executionId, BulkRequest request) {
+                    }
+
+                    @Override
+                    public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+                        logger.debug("Bulk deleted " + request.numberOfActions() + " paths");
+                    }
+
+                    @Override
+                    public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+                        logger.error(failure);
+                    }
+                })
+                .setBulkActions(10_000)
+                .setBulkSize(new ByteSizeValue(10, ByteSizeUnit.MB))
+                .setFlushInterval(TimeValue.timeValueSeconds(1))
+                .setConcurrentRequests(4)
+                .build();
+
         for (String path : pathsToDelete) {
             if (!parameters.isNoop()) {
-                client.prepareDelete("cyanite_paths", "path", parameters.getTenant() + "_" + path).execute().get();
+                bulkProcessor.add(new DeleteRequest("cyanite_paths", "path", parameters.getTenant() + "_" + path));
                 logger.info("Deleted path: " + path);
             } else {
                 logger.info("Deleted path: " + path + " (noop)");
             }
         }
+
+        if (bulkProcessor.awaitClose(Long.MAX_VALUE, TimeUnit.SECONDS)) {
+            logger.info("Bulk processor closed");
+        } else {
+            logger.error("Failed to close bulk processor");
+        }
+
     }
 
     private List<String> getEmptyPaths(PathTree tree) {
