@@ -1,50 +1,60 @@
 package net.iponweb.disthene.cleaner;
 
-import com.datastax.driver.core.*;
-import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
-import com.datastax.driver.core.policies.TokenAwarePolicy;
-import com.google.common.util.concurrent.*;
-import org.apache.log4j.Logger;
+import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
+import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
+import com.datastax.oss.driver.api.core.cql.PreparedStatement;
+import com.datastax.oss.driver.api.core.cql.ResultSet;
+import com.datastax.oss.driver.api.core.metadata.Metadata;
+import com.datastax.oss.driver.api.core.metadata.Node;
+import com.datastax.oss.driver.internal.core.loadbalancing.DcInferringLoadBalancingPolicy;
+import org.apache.http.HttpHost;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
-import org.elasticsearch.action.count.CountResponse;
 import org.elasticsearch.action.delete.DeleteRequest;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchType;
-import org.elasticsearch.client.transport.TransportClient;
-import org.elasticsearch.common.settings.ImmutableSettings;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.transport.InetSocketTransportAddress;
+import org.elasticsearch.action.search.SearchScrollRequest;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.client.core.CountRequest;
+import org.elasticsearch.client.core.CountResponse;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.Scroll;
 import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.SearchHits;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-@SuppressWarnings("UnstableApiUsage")
 public class Cleaner {
 
-    private static final Logger logger = Logger.getLogger(Cleaner.class);
+    private static final Logger logger = LogManager.getLogger(Cleaner.class);
 
     private static final Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
-    private static final String TABLE_QUERY = "SELECT COUNT(1) FROM SYSTEM.SCHEMA_COLUMNFAMILIES WHERE KEYSPACE_NAME=? AND COLUMNFAMILY_NAME=?";
+    private static final String TABLE_QUERY = "SELECT COUNT(1) FROM SYSTEM_SCHEMA.TABLES WHERE KEYSPACE_NAME=? AND TABLE_NAME=?";
+    private static final String INDEX_NAME = "disthene";
 
     private final DistheneCleanerParameters parameters;
 
-    private TransportClient client;
-    private Session session;
+    private RestHighLevelClient client;
+    private CqlSession session;
     private final Pattern excludePattern;
 
     Cleaner(DistheneCleanerParameters parameters) {
@@ -52,13 +62,13 @@ public class Cleaner {
         excludePattern = Pattern.compile(parameters.getExclusions().stream().map(WildcardUtil::getPathsRegExFromWildcard).collect(Collectors.joining("|")));
     }
 
-    void clean() throws ExecutionException, InterruptedException, IOException {
+    void clean() throws InterruptedException, IOException {
         connectToES();
         connectToCassandra();
 
         // check if tenant table exists. If not, just return
         ResultSet resultSet = session.execute(TABLE_QUERY, "metric", String.format("metric_%s_60", getNormalizedTenant(parameters.getTenant())));
-        if (resultSet.one().getLong(0) <= 0) {
+        if (Objects.requireNonNull(resultSet.one()).getLong(0) <= 0) {
             // skip
             logger.info("Tenant table doesn't exist. Skipping");
             return;
@@ -81,13 +91,13 @@ public class Cleaner {
         logger.info("Deleted empty paths");
     }
 
-    private void deleteEmptyPaths() throws InterruptedException {
+    private void deleteEmptyPaths() throws InterruptedException, IOException {
         PathTree tree = getPathsTree();
 
         List<String> pathsToDelete = getEmptyPaths(tree);
 
         BulkProcessor bulkProcessor = BulkProcessor.builder(
-                client,
+                (request, listener) -> client.bulkAsync(request, RequestOptions.DEFAULT, listener),
                 new BulkProcessor.Listener() {
                     @Override
                     public void beforeBulk(long executionId, BulkRequest request) {
@@ -102,7 +112,7 @@ public class Cleaner {
                     public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
                         logger.error(failure);
                     }
-                })
+                }, "deleteEmptyPaths")
                 .setBulkActions(10_000)
                 .setBulkSize(new ByteSizeValue(10, ByteSizeUnit.MB))
                 .setFlushInterval(TimeValue.timeValueSeconds(1))
@@ -111,7 +121,7 @@ public class Cleaner {
 
         for (String path : pathsToDelete) {
             if (!parameters.isNoop()) {
-                bulkProcessor.add(new DeleteRequest("cyanite_paths", "path", parameters.getTenant() + "_" + path));
+                bulkProcessor.add(new DeleteRequest(INDEX_NAME, parameters.getTenant() + "_" + path));
                 logger.info("Deleted path: " + path);
             } else {
                 logger.info("Deleted path: " + path + " (noop)");
@@ -160,104 +170,97 @@ public class Cleaner {
         return toBeDeleted;
     }
 
-    private void cleanup() {
+    private void cleanup() throws IOException {
         long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
 
-        String tenantTable = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
-        String tenantTable900 = String.format("metric.metric_%s_900", getNormalizedTenant(parameters.getTenant()));
+        String table60 = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
+        String table900 = String.format("metric.metric_%s_900", getNormalizedTenant(parameters.getTenant()));
 
-        logger.info("Tenant tables: " + tenantTable + ", " + tenantTable900);
+        logger.info("Tenant tables: " + table60 + ", " + table900);
 
-        final PreparedStatement commonStatement = session.prepare(
-                "select path from metric.metric where tenant = '" + parameters.getTenant() +
-                        "' and path = ? and rollup = 60 and period = 89280 and " + "time >= " + cutoff + " limit 1"
+        final PreparedStatement statement = session.prepare(
+                "select path from " + table60 + " where path = ? and time >= " + cutoff + " limit 1"
         );
 
-        final PreparedStatement tenantStatement = session.prepare(
-                "select path from " + tenantTable + " where path = ? and time >= " + cutoff + " limit 1"
+        final PreparedStatement deleteStatement60 = session.prepare(
+                "delete from " + table60 + " where path = ?"
         );
 
-        final PreparedStatement commonDeleteStatement = session.prepare(
-                "delete from metric.metric where rollup = 900 and period = 69120 and path = ? and tenant = '" + parameters.getTenant() + "'"
+        final PreparedStatement deleteStatement900 = session.prepare(
+                "delete from " + table900 + " where path = ?"
         );
 
-        final PreparedStatement tenantDeleteStatement = session.prepare(
-                "delete from " + tenantTable900 + " where path = ?"
-        );
+        CountRequest countRequest = new CountRequest(INDEX_NAME)
+                .query(QueryBuilders.boolQuery()
+                        .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                        .must(QueryBuilders.termQuery("leaf", true)));
 
-        CountResponse countResponse = client.prepareCount("cyanite_paths")
-                .setQuery(
-                        QueryBuilders.boolQuery()
-                                .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
-                                .must(QueryBuilders.termQuery("leaf", true))
-                )
-                .execute()
-                .actionGet();
+
+        CountResponse countResponse = client.count(countRequest, RequestOptions.DEFAULT);
 
         long total = countResponse.getCount();
         logger.info("Got " + total + " paths");
 
         final AtomicInteger counter = new AtomicInteger(0);
-        ListeningExecutorService executor = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(parameters.getThreads()));
+        ExecutorService executor = Executors.newFixedThreadPool(parameters.getThreads());
 
-        SearchResponse response = client.prepareSearch("cyanite_paths")
-                .setSearchType(SearchType.SCAN)
-                .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                .setSize(10_000)
-                .setQuery(
+        final Scroll scroll = new Scroll(TimeValue.timeValueHours(4L));
+
+        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
+                .fetchSource("path", null)
+                .query(
                         QueryBuilders.boolQuery()
                                 .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
                                 .must(QueryBuilders.termQuery("leaf", true))
-                )
-                .setSearchType(SearchType.SCAN)
-                .addField("path")
-                .execute().actionGet();
+                );
 
-        response = client.prepareSearchScroll(response.getScrollId())
-                .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                .execute().actionGet();
+        SearchRequest request = new SearchRequest(INDEX_NAME)
+                .source(sourceBuilder)
+                .scroll(scroll);
 
-        while (response.getHits().getHits().length > 0) {
-            for (SearchHit hit : response.getHits()) {
-                String path = hit.field("path").getValue();
+        SearchResponse response = client.search(request, RequestOptions.DEFAULT);
+        String scrollId = response.getScrollId();
+
+        SearchHits hits = response.getHits();
+
+        while (hits.getHits().length > 0) {
+            for (SearchHit hit : hits) {
+                String path = String.valueOf(hit.getSourceAsMap().get("path"));
 
                 if (!excludePattern.matcher(path).matches()) {
-                    ListenableFuture<Void> future = executor.submit(
-                            new SinglePathCallable(
+
+                    CompletableFuture.supplyAsync(
+                            new SinglePathSupplier(
                                     client,
                                     session,
                                     parameters.getTenant(),
-                                    commonStatement,
-                                    tenantStatement,
-                                    commonDeleteStatement,
-                                    tenantDeleteStatement,
+                                    statement,
+                                    deleteStatement60,
+                                    deleteStatement900,
                                     path,
                                     parameters.isNoop()
-                            )
-                    );
-                    Futures.addCallback(future, new FutureCallback<Void>() {
-                        @Override
-                        public void onSuccess(Void aVoid) {
-                            int cc = counter.addAndGet(1);
-                            if (cc % 100000 == 0) {
-                                logger.info("Processed: " + (int)(((double) cc / total) * 100) + "%");
-                            }
-                        }
+                            ), executor)
+                            .whenComplete((unused, throwable) -> {
+                                if (throwable != null) {
+                                    logger.error("Path processing failed", throwable);
+                                } else {
+                                    int cc = counter.addAndGet(1);
+                                    if (cc % 100000 == 0) {
+                                        logger.info("Processed: " + (int) (((double) cc / total) * 100) + "%");
+                                    }
+                                }
 
-                        @Override
-                        public void onFailure(Throwable throwable) {
-                            logger.error("Unexpected error:", throwable);
-                        }
-                    });
+                            });
                 } else {
                     counter.addAndGet(1);
                 }
 
             }
 
-            response = client.prepareSearchScroll(response.getScrollId())
-                    .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                    .execute().actionGet();
+            SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId).scroll(scroll);
+            response = client.scroll(scrollRequest, RequestOptions.DEFAULT);
+            scrollId = response.getScrollId();
+            hits = response.getHits();
         }
 
         executor.shutdown();
@@ -277,49 +280,33 @@ public class Cleaner {
     }
 
     private void connectToES() {
-        Settings settings = ImmutableSettings.settingsBuilder()
-                .put("cluster.name", "cyanite")
-                .put("client.transport.ping_timeout", "120s")
-                .build();
-        client = new TransportClient(settings);
-        client.addTransportAddress(new InetSocketTransportAddress(parameters.getElasticSearchContactPoint(), 9300));
+        client = new RestHighLevelClient(
+                RestClient.builder(new HttpHost(parameters.getElasticSearchContactPoint(), 9200)));
     }
 
     private void connectToCassandra() {
-        SocketOptions socketOptions = new SocketOptions();
-        socketOptions.setReceiveBufferSize(8388608);
-        socketOptions.setSendBufferSize(1048576);
-        socketOptions.setTcpNoDelay(false);
-        socketOptions.setReadTimeoutMillis(1_000_000);
-        socketOptions.setReadTimeoutMillis(1_000_000);
+        DriverConfigLoader loader =
+                DriverConfigLoader.programmaticBuilder()
+                        .withString(DefaultDriverOption.PROTOCOL_COMPRESSION, "lz4")
+                        .withStringList(DefaultDriverOption.CONTACT_POINTS, List.of(parameters.getCassandraContactPoint() + ":9042"))
+                        .withInt(DefaultDriverOption.CONNECTION_MAX_REQUESTS, 128)
+                        .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(1_000_000))
+                        .withString(DefaultDriverOption.REQUEST_CONSISTENCY, "ONE")
+                        .withClass(DefaultDriverOption.LOAD_BALANCING_POLICY_CLASS, DcInferringLoadBalancingPolicy.class)
+                        .build();
 
-        PoolingOptions poolingOptions = new PoolingOptions();
-        poolingOptions.setMaxConnectionsPerHost(HostDistance.LOCAL, 32);
-        poolingOptions.setMaxConnectionsPerHost(HostDistance.REMOTE, 32);
-        poolingOptions.setMaxRequestsPerConnection(HostDistance.REMOTE, 128);
-        poolingOptions.setMaxRequestsPerConnection(HostDistance.LOCAL, 128);
+        session = CqlSession.builder().withConfigLoader(loader).build();
 
-        Cluster.Builder builder = Cluster.builder()
-                .withSocketOptions(socketOptions)
-                .withCompression(ProtocolOptions.Compression.LZ4)
-                .withPoolingOptions(poolingOptions)
-                .withProtocolVersion(ProtocolVersion.V2)
-                .withPort(9042);
-
-        builder.withLoadBalancingPolicy(new TokenAwarePolicy(DCAwareRoundRobinPolicy.builder().build()));
-        builder.addContactPoint(parameters.getCassandraContactPoint());
-
-        Cluster cluster = builder.build();
-        Metadata metadata = cluster.getMetadata();
+        Metadata metadata = session.getMetadata();
         logger.debug("Connected to cluster: " + metadata.getClusterName());
-        for (Host host : metadata.getAllHosts()) {
-            logger.debug(String.format("Datacenter: %s; Host: %s; Rack: %s", host.getDatacenter(), host.getAddress(), host.getRack()));
+        for (Node node : metadata.getNodes().values()) {
+            logger.debug(String.format("Datacenter: %s; Host: %s; Rack: %s",
+                    node.getDatacenter(),
+                    node.getBroadcastAddress().isPresent() ? node.getBroadcastAddress().get().toString() : "unknown", node.getRack()));
         }
-
-        session = cluster.connect();
     }
 
-    private void restoreBrokenPaths() throws IOException, ExecutionException, InterruptedException {
+    private void restoreBrokenPaths() throws IOException {
         PathTree tree = getPathsTree();
 
         int depth = 1;
@@ -333,7 +320,7 @@ public class Cleaner {
         }
     }
 
-    private void restoreBrokenPaths(PathData node, String prefix, int depth) throws IOException, ExecutionException, InterruptedException {
+    private void restoreBrokenPaths(PathData node, String prefix, int depth) throws IOException {
         for (Map.Entry<String, PathData> entry : node.children.entrySet()) {
             if (!entry.getValue().real) {
                 restoreSinglePath(prefix + "." + entry.getKey(), entry.getValue().leaf && entry.getValue().children.size() == 0, depth);
@@ -344,61 +331,68 @@ public class Cleaner {
 
     }
 
-    private void restoreSinglePath(String path, boolean leaf, int depth) throws IOException, ExecutionException, InterruptedException {
+    private void restoreSinglePath(String path, boolean leaf, int depth) throws IOException {
         if (!parameters.isNoop()) {
-            client.prepareIndex("cyanite_paths", "path", parameters.getTenant() + "_" + path)
-                    .setSource(
-                            XContentFactory.jsonBuilder().startObject()
-                                    .field("tenant", parameters.getTenant())
-                                    .field("path", path)
-                                    .field("depth", depth)
-                                    .field("leaf", leaf)
-                                    .endObject()
-                    )
-                    .execute()
-                    .get();
+            IndexRequest request = new IndexRequest(INDEX_NAME).id(parameters.getTenant() + "_" + path).source(
+                    XContentFactory.jsonBuilder().startObject()
+                            .field("tenant", parameters.getTenant())
+                            .field("path", path)
+                            .field("depth", depth)
+                            .field("leaf", leaf)
+                            .endObject()
+            );
+
+            client.index(request, RequestOptions.DEFAULT);
+
             logger.info("Will reindex path " + path + " with depth " + depth + " as " + (leaf ? "leaf" : "non-leaf"));
         } else {
             logger.info("Will reindex path " + path + " with depth " + depth + " as " + (leaf ? "leaf" : "non-leaf") + " (noop)");
         }
     }
 
-    private PathTree getPathsTree() {
+    private PathTree getPathsTree() throws IOException {
         PathTree tree = new PathTree();
 
-        CountResponse countResponse = client.prepareCount("cyanite_paths")
-                .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
-                .execute()
-                .actionGet();
+        CountRequest countRequest = new CountRequest(INDEX_NAME)
+                .query(QueryBuilders.termQuery("tenant", parameters.getTenant()));
+
+        CountResponse countResponse = client.count(countRequest, RequestOptions.DEFAULT);
 
         long count = countResponse.getCount();
         logger.info("A priori number of paths: " + count);
         logger.info("Retrieving paths");
 
-        SearchResponse response = client.prepareSearch("cyanite_paths")
-                .setSearchType(SearchType.SCAN)
-                .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                .setSize(10_000)
-                .setQuery(QueryBuilders.termQuery("tenant", parameters.getTenant()))
-                .addFields("path", "leaf")
-                .execute().actionGet();
 
-        response = client.prepareSearchScroll(response.getScrollId())
-                .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                .execute().actionGet();
+        final Scroll scroll = new Scroll(TimeValue.timeValueHours(4L));
+
+        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
+                .fetchSource(new String[]{"path", "leaf"}, null)
+                .query(QueryBuilders.termQuery("tenant", parameters.getTenant()));
+
+        SearchRequest request = new SearchRequest(INDEX_NAME)
+                .source(sourceBuilder)
+                .scroll(scroll);
+
+
+        SearchResponse response = client.search(request, RequestOptions.DEFAULT);
+        String scrollId = response.getScrollId();
+
+        SearchHits hits = response.getHits();
 
         long counter = 0;
 
-        while (response.getHits().getHits().length > 0) {
-            for (SearchHit hit : response.getHits()) {
-                tree.addPath(hit.field("path").getValue(), hit.field("leaf").getValue());
+        while (hits.getHits().length > 0) {
+            for (SearchHit hit : hits) {
+                tree.addPath((String) hit.getSourceAsMap().get("path"), (Boolean) hit.getSourceAsMap().get("leaf"));
                 counter++;
             }
-            logger.info("Retrieved: " + (int)(((double) counter / count) * 100) + "%");
 
-            response = client.prepareSearchScroll(response.getScrollId())
-                    .setScroll(new TimeValue(4, TimeUnit.HOURS))
-                    .execute().actionGet();
+            logger.info("Retrieved: " + (int) (((double) counter / count) * 100) + "%");
+
+            SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId).scroll(scroll);
+            response = client.scroll(scrollRequest, RequestOptions.DEFAULT);
+            scrollId = response.getScrollId();
+            hits = response.getHits();
         }
 
         logger.info("Number of paths: " + counter);
@@ -443,59 +437,58 @@ public class Cleaner {
         }
     }
 
-    private static class SinglePathCallable implements Callable<Void> {
-        private final TransportClient client;
-        private final Session session;
+    private static class SinglePathSupplier implements Supplier<Void> {
+
+        private final RestHighLevelClient client;
+        private final CqlSession session;
         private final String tenant;
-        private final PreparedStatement commonStatement;
-        private final PreparedStatement tenantStatement;
-        private final PreparedStatement commonDeleteStatement;
-        private final PreparedStatement tenantDeleteStatement;
+        private final PreparedStatement statement;
+        private final PreparedStatement deleteStatement60;
+        private final PreparedStatement deleteStatement900;
         private final String path;
         private final boolean noop;
 
-
-        SinglePathCallable(
-                TransportClient client,
-                Session session,
-                String tenant,
-                PreparedStatement commonStatement,
-                PreparedStatement tenantStatement,
-                PreparedStatement commonDeleteStatement,
-                PreparedStatement tenantDeleteStatement,
-                String path,
-                boolean noop
-        ) {
+        public SinglePathSupplier(RestHighLevelClient client, CqlSession session, String tenant, PreparedStatement statement, PreparedStatement deleteStatement60, PreparedStatement deleteStatement900, String path, boolean noop) {
             this.client = client;
             this.session = session;
             this.tenant = tenant;
-            this.commonStatement = commonStatement;
-            this.tenantStatement = tenantStatement;
-            this.commonDeleteStatement = commonDeleteStatement;
-            this.tenantDeleteStatement = tenantDeleteStatement;
+            this.statement = statement;
+            this.deleteStatement60 = deleteStatement60;
+            this.deleteStatement900 = deleteStatement900;
             this.path = path;
             this.noop = noop;
         }
 
         @Override
-        public Void call() throws Exception {
-            List<ResultSetFuture> futures = new ArrayList<>();
-            futures.add(session.executeAsync(commonStatement.bind(path)));
-            futures.add(session.executeAsync(tenantStatement.bind(path)));
+        public Void get() {
+            session.executeAsync(statement.bind(path))
+                    .whenComplete((asyncResultSet, throwable) -> {
+                        if (throwable != null) {
+                            logger.error("Select statement failed", throwable);
+                        } else {
+                            if (Objects.requireNonNull(asyncResultSet.one()).getLong(0) <= 0) {
+                                if (!noop) {
+                                    try {
+                                        session.execute(deleteStatement60.bind(path));
+                                        session.execute(deleteStatement900.bind(path));
 
-            if (Futures.allAsList(futures).get().stream().mapToInt(rs -> rs.all().size()).sum() <= 0) {
-                if (!noop) {
-                    session.execute(commonDeleteStatement.bind(path));
-                    session.execute(tenantDeleteStatement.bind(path));
+                                        DeleteRequest request = new DeleteRequest(INDEX_NAME, tenant + "_" + path);
+                                        client.delete(request, RequestOptions.DEFAULT);
 
-                    client.prepareDelete("cyanite_paths", "path", tenant + "_" + path).execute().get();
-                    logger.info("Deleted path data: " + path);
-                } else {
-                    logger.info("Deleted path data: " + path + " (noop)");
-                }
-            }
+                                        logger.info("Deleted path data: " + path);
+                                    } catch (IOException e) {
+                                        logger.error("Delete failed", e);
+                                    }
+                                } else {
+                                    logger.info("Deleted path data: " + path + " (noop)");
+                                }
+                            }
+                        }
+                    });
 
             return null;
         }
     }
+
+
 }

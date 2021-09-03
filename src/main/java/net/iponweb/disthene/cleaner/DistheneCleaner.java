@@ -1,9 +1,12 @@
 package net.iponweb.disthene.cleaner;
 
 import org.apache.commons.cli.*;
-import org.apache.log4j.*;
-
-import java.io.IOException;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.apache.logging.log4j.core.config.builder.api.*;
+import org.apache.logging.log4j.core.config.builder.impl.BuiltConfiguration;
 
 /**
  * Hello world!
@@ -28,7 +31,7 @@ public class DistheneCleaner {
         options.addOption("tn", "tenant", true, "Tenant");
         options.addOption("n", "noop", false, "Noop mode");
 
-        CommandLineParser parser = new GnuParser();
+        CommandLineParser parser = new DefaultParser();
 
         try {
             CommandLine commandLine = parser.parse(options, args);
@@ -103,24 +106,40 @@ public class DistheneCleaner {
     private static void configureLog(String location, String level) {
         Level logLevel = Level.toLevel(level, Level.INFO);
 
-        Logger rootLogger = Logger.getRootLogger();
-        rootLogger.setLevel(logLevel);
+        ConfigurationBuilder<BuiltConfiguration> builder = ConfigurationBuilderFactory.newConfigurationBuilder();
 
-        PatternLayout layout = new PatternLayout("%p %d{dd.MM.yyyy HH:mm:ss,SSS} [%t] %c %x - %m%n");
-        rootLogger.addAppender(new ConsoleAppender(layout));
+        RootLoggerComponentBuilder rootLogger = builder.newRootLogger(logLevel);
 
-        logger = Logger.getLogger(DistheneCleaner.class);
+        // console
+        LayoutComponentBuilder layout = builder.newLayout("PatternLayout")
+                .addAttribute("pattern", "%p %d{dd.MM.yyyy HH:mm:ss,SSS} [%t] %c %x - %m%n");
 
+        AppenderComponentBuilder console = builder.newAppender("stdout", "Console").add(layout);
+        builder.add(console);
+        rootLogger.add(builder.newAppenderRef("stdout"));
+
+        // file
         if (location != null) {
-            try {
-                RollingFileAppender fileAppender = new RollingFileAppender(layout, location);
-                fileAppender.setMaxBackupIndex(100);
-                fileAppender.setMaximumFileSize(100*1024*1024);
-                rootLogger.addAppender(fileAppender);
-            } catch (IOException e) {
-                logger.error("Failed to add file appender: ", e);
-            }
+            AppenderComponentBuilder rollingFile = builder.newAppender("rolling", "RollingFile");
+            rollingFile.addAttribute("fileName", location);
+            rollingFile.addAttribute("filePattern", location + "-%d{MM-dd-yy}.log.gz");
+
+            @SuppressWarnings("rawtypes")
+            ComponentBuilder triggeringPolicies = builder.newComponent("Policies")
+                    .addComponent(builder.newComponent("TimeBasedTriggeringPolicy")
+                            .addAttribute("interval", "1"));
+            rollingFile.addComponent(triggeringPolicies);
+
+            builder.add(rollingFile);
+
+            rootLogger.add(builder.newAppenderRef("rolling"));
         }
+
+        builder.add(rootLogger);
+
+        Configurator.initialize(builder.build());
+
+        logger = LogManager.getLogger(DistheneCleaner.class);
     }
 
 }
