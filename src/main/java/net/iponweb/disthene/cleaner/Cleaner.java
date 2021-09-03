@@ -208,6 +208,7 @@ public class Cleaner {
 
         SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
                 .fetchSource("path", null)
+                .size(10_000)
                 .query(
                         QueryBuilders.boolQuery()
                                 .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
@@ -367,6 +368,7 @@ public class Cleaner {
 
         SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
                 .fetchSource(new String[]{"path", "leaf"}, null)
+                .size(10_000)
                 .query(QueryBuilders.termQuery("tenant", parameters.getTenant()));
 
         SearchRequest request = new SearchRequest(INDEX_NAME)

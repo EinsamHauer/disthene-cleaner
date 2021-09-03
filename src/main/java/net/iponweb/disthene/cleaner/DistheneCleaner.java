@@ -15,14 +15,12 @@ public class DistheneCleaner {
     private static Logger logger;
 
     private static final int DEFAULT_THREADS = 32;
-//    private static final String DEFAULT_ROLLUP_STRING = "60:5356800,900:62208000";
     private static final long DEFAULT_THRESHOLD = 2678400;
 
     public static void main(String[] args) {
         Options options = new Options();
         options.addOption("l", "log-location", true, "log file location");
         options.addOption("ll", "log-level", true, "log level (i.e.: DEBUG, INFO, ERROR, etc)");
-        options.addOption("r", "rollups", true, "rollups, format like 900:62208000");
         options.addOption("t", "threads", true, "number of threads");
         options.addOption("c", "cassandra", true, "Cassandra contact point");
         options.addOption("e", "elasticsearch", true, "Elasticsearch contact point");
