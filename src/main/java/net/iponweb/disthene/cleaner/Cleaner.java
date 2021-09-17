@@ -170,7 +170,7 @@ public class Cleaner {
         return toBeDeleted;
     }
 
-    private void cleanup() throws IOException {
+    private void cleanup() throws IOException, InterruptedException {
         long cutoff = System.currentTimeMillis() / 1000 - parameters.getThreshold();
 
         String table60 = String.format("metric.metric_%s_60", getNormalizedTenant(parameters.getTenant()));
@@ -222,6 +222,8 @@ public class Cleaner {
         SearchResponse response = client.search(request, RequestOptions.DEFAULT);
         String scrollId = response.getScrollId();
 
+        Semaphore semaphore = new Semaphore(parameters.getThreads() * 2);
+
         SearchHits hits = response.getHits();
 
         while (hits.getHits().length > 0) {
@@ -229,6 +231,8 @@ public class Cleaner {
                 String path = String.valueOf(hit.getSourceAsMap().get("path"));
 
                 if (!excludePattern.matcher(path).matches()) {
+
+                    semaphore.acquire();
 
                     CompletableFuture.supplyAsync(
                             new SinglePathSupplier(
@@ -251,6 +255,7 @@ public class Cleaner {
                                     }
                                 }
 
+                                semaphore.release();
                             });
                 } else {
                     counter.addAndGet(1);
