@@ -295,7 +295,7 @@ public class Cleaner {
                 DriverConfigLoader.programmaticBuilder()
                         .withString(DefaultDriverOption.PROTOCOL_COMPRESSION, "lz4")
                         .withStringList(DefaultDriverOption.CONTACT_POINTS, List.of(parameters.getCassandraContactPoint() + ":9042"))
-                        .withInt(DefaultDriverOption.CONNECTION_MAX_REQUESTS, 128)
+                        .withInt(DefaultDriverOption.CONNECTION_MAX_REQUESTS, 2048)
                         .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(1_000_000))
                         .withString(DefaultDriverOption.REQUEST_CONSISTENCY, "ONE")
                         .withClass(DefaultDriverOption.LOAD_BALANCING_POLICY_CLASS, DcInferringLoadBalancingPolicy.class)
@@ -304,9 +304,9 @@ public class Cleaner {
         session = CqlSession.builder().withConfigLoader(loader).build();
 
         Metadata metadata = session.getMetadata();
-        logger.debug("Connected to cluster: " + metadata.getClusterName());
+        logger.info("Connected to cluster: " + metadata.getClusterName());
         for (Node node : metadata.getNodes().values()) {
-            logger.debug(String.format("Datacenter: %s; Host: %s; Rack: %s",
+            logger.info(String.format("Datacenter: %s; Host: %s; Rack: %s",
                     node.getDatacenter(),
                     node.getBroadcastAddress().isPresent() ? node.getBroadcastAddress().get().toString() : "unknown", node.getRack()));
         }
