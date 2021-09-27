@@ -8,6 +8,7 @@ import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.datastax.oss.driver.api.core.metadata.Metadata;
 import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.internal.core.loadbalancing.DcInferringLoadBalancingPolicy;
+import com.datastax.oss.driver.internal.core.session.throttling.ConcurrencyLimitingRequestThrottler;
 import org.apache.http.HttpHost;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -50,6 +51,9 @@ public class Cleaner {
     private static final Pattern NORMALIZATION_PATTERN = Pattern.compile("[^0-9a-zA-Z_]");
     private static final String TABLE_QUERY = "SELECT COUNT(1) FROM SYSTEM_SCHEMA.TABLES WHERE KEYSPACE_NAME=? AND TABLE_NAME=?";
     private static final String INDEX_NAME = "disthene";
+
+    private static final int MAX_QUEUE_SIZE = 1024*1024;
+    private static final int MAX_CONCURRENT_REQUESTS = 1024;
 
     private final DistheneCleanerParameters parameters;
 
@@ -299,6 +303,9 @@ public class Cleaner {
                         .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(1_000_000))
                         .withString(DefaultDriverOption.REQUEST_CONSISTENCY, "ONE")
                         .withClass(DefaultDriverOption.LOAD_BALANCING_POLICY_CLASS, DcInferringLoadBalancingPolicy.class)
+                        .withClass(DefaultDriverOption.REQUEST_THROTTLER_CLASS, ConcurrencyLimitingRequestThrottler.class)
+                        .withInt(DefaultDriverOption.REQUEST_THROTTLER_MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_REQUESTS)
+                        .withInt(DefaultDriverOption.REQUEST_THROTTLER_MAX_QUEUE_SIZE, MAX_QUEUE_SIZE)
                         .build();
 
         session = CqlSession.builder().withConfigLoader(loader).build();
