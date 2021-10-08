@@ -99,6 +99,7 @@ public class Cleaner {
         PathTree tree = getPathsTree();
 
         List<String> pathsToDelete = getEmptyPaths(tree);
+        logger.info("Will delete " + pathsToDelete.size() + " paths");
 
         BulkProcessor bulkProcessor = BulkProcessor.builder(
                 (request, listener) -> client.bulkAsync(request, RequestOptions.DEFAULT, listener),
@@ -299,7 +300,6 @@ public class Cleaner {
                 DriverConfigLoader.programmaticBuilder()
                         .withString(DefaultDriverOption.PROTOCOL_COMPRESSION, "lz4")
                         .withStringList(DefaultDriverOption.CONTACT_POINTS, List.of(parameters.getCassandraContactPoint() + ":9042"))
-                        .withInt(DefaultDriverOption.CONNECTION_MAX_REQUESTS, 2048)
                         .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(1_000_000))
                         .withString(DefaultDriverOption.REQUEST_CONSISTENCY, "ONE")
                         .withClass(DefaultDriverOption.LOAD_BALANCING_POLICY_CLASS, DcInferringLoadBalancingPolicy.class)
@@ -475,30 +475,25 @@ public class Cleaner {
 
         @Override
         public Void get() {
-            session.executeAsync(statement.bind(path))
-                    .whenComplete((asyncResultSet, throwable) -> {
-                        if (throwable != null) {
-                            logger.error("Select statement failed", throwable);
-                        } else {
-                            if (Objects.requireNonNull(asyncResultSet.one()).getLong(0) <= 0) {
-                                if (!noop) {
-                                    try {
-                                        session.execute(deleteStatement60.bind(path));
-                                        session.execute(deleteStatement900.bind(path));
+            ResultSet resultSet = session.execute(statement.bind(path));
 
-                                        DeleteRequest request = new DeleteRequest(INDEX_NAME, tenant + "_" + path);
-                                        client.delete(request, RequestOptions.DEFAULT);
+            if (resultSet.one() == null) {
+                if (!noop) {
+                    try {
+                        session.execute(deleteStatement60.bind(path));
+                        session.execute(deleteStatement900.bind(path));
 
-                                        logger.info("Deleted path data: " + path);
-                                    } catch (IOException e) {
-                                        logger.error("Delete failed", e);
-                                    }
-                                } else {
-                                    logger.info("Deleted path data: " + path + " (noop)");
-                                }
-                            }
-                        }
-                    });
+                        DeleteRequest request = new DeleteRequest(INDEX_NAME, tenant + "_" + path);
+                        client.delete(request, RequestOptions.DEFAULT);
+
+                        logger.info("Deleted path data: " + path);
+                    } catch (IOException e) {
+                        logger.error("Delete failed", e);
+                    }
+                } else {
+                    logger.info("Deleted path data: " + path + " (noop)");
+                }
+            }
 
             return null;
         }
