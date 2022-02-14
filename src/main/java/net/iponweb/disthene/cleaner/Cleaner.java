@@ -197,7 +197,7 @@ public class Cleaner {
 
         CountRequest countRequest = new CountRequest(INDEX_NAME)
                 .query(QueryBuilders.boolQuery()
-                        .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                        .must(QueryBuilders.termQuery("tenant.keyword", parameters.getTenant()))
                         .must(QueryBuilders.termQuery("leaf", true)));
 
 
@@ -216,7 +216,7 @@ public class Cleaner {
                 .size(10_000)
                 .query(
                         QueryBuilders.boolQuery()
-                                .must(QueryBuilders.termQuery("tenant", parameters.getTenant()))
+                                .must(QueryBuilders.termQuery("tenant.keyword", parameters.getTenant()))
                                 .must(QueryBuilders.termQuery("leaf", true))
                 );
 
@@ -367,7 +367,7 @@ public class Cleaner {
         PathTree tree = new PathTree();
 
         CountRequest countRequest = new CountRequest(INDEX_NAME)
-                .query(QueryBuilders.termQuery("tenant", parameters.getTenant()));
+                .query(QueryBuilders.termQuery("tenant.keyword", parameters.getTenant()));
 
         CountResponse countResponse = client.count(countRequest, RequestOptions.DEFAULT);
 
@@ -381,7 +381,7 @@ public class Cleaner {
         SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
                 .fetchSource(new String[]{"path", "leaf"}, null)
                 .size(10_000)
-                .query(QueryBuilders.termQuery("tenant", parameters.getTenant()));
+                .query(QueryBuilders.termQuery("tenant.keyword", parameters.getTenant()));
 
         SearchRequest request = new SearchRequest(INDEX_NAME)
                 .source(sourceBuilder)
